@@ -1,0 +1,13 @@
+{
+  "name": "claude-unity-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for controlling Unity Editor via Claude Code",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
