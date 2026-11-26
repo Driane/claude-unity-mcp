@@ -151,6 +151,23 @@ Set `CLAUDE_UNITY_URL` to point the server at a different host or port.
   `set_component_property` reach much of them in the meantime.
 - **Lightmap baking**, which is long-running and would need the same polling model as tests.
 
+## Pitfalls found by running it
+
+- **Loopback spellings.** The bridge registers three prefixes: `localhost`, `127.0.0.1` and `[::1]`.
+  `HttpListener` matches on the request's Host header, so each spelling a client might dial needs
+  its own prefix. `localhost` alone binds IPv6-only on Windows; the two literal addresses alone make
+  a request for Host `localhost:6400` fail with HTTP 400, which is exactly how the MCP server dials.
+- **Domain reloads.** The listener is closed on `AssemblyReloadEvents.beforeAssemblyReload`,
+  otherwise recompiling any script leaves the port held and the bridge cannot rebind. The bridge is
+  briefly unreachable during a reload, so a client that runs right after a script change should
+  retry for a few seconds.
+- **Unity does not import glTF.** A `.glb` or `.gltf` lands as an opaque `DefaultAsset` that nothing
+  can instantiate. Export FBX, or install `com.unity.cloud.gltfast`. `import_file` now warns, and
+  `instantiate_prefab` says so instead of "prefab not found".
+- **Blender is Z-up, Unity is Y-up.** Export FBX from Blender with `bake_space_transform=True`.
+  Otherwise the model arrives with −90° on X baked into its root rotation, and setting an absolute
+  rotation afterwards wipes that correction and lays the object on its side.
+
 ## Verifying a change
 
 The plugin compiles against the real Unity assemblies without opening the Editor, which catches a

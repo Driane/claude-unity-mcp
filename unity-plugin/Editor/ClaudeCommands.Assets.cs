@@ -241,10 +241,19 @@ public static partial class ClaudeUnityBridge
         AssetDatabase.ImportAsset(destination, ImportAssetOptions.ForceUpdate);
 
         var info = new FileInfo(fullPath);
-        return Ok(D("path", destination, "bytes", info.Length,
-                    "assetType", AssetDatabase.GetMainAssetTypeAtPath(destination) == null
-                        ? "unknown"
-                        : AssetDatabase.GetMainAssetTypeAtPath(destination).Name));
+        var importedType = AssetDatabase.GetMainAssetTypeAtPath(destination);
+        var typeName = importedType == null ? "unknown" : importedType.Name;
+
+        var result = D("path", destination, "bytes", info.Length, "assetType", typeName);
+
+        // DefaultAsset means Unity copied the file but has no importer for it,
+        // so nothing in the project can actually use its contents.
+        if (typeName == "DefaultAsset")
+            result["warning"] = "Unity has no importer for this format: the file is in the project " +
+                                "but unusable. Models should be .fbx, .obj or .dae; .glb/.gltf need " +
+                                "the com.unity.cloud.gltfast package.";
+
+        return Ok(result);
     }
 
     static string CmdSetTextureSettings(object p)

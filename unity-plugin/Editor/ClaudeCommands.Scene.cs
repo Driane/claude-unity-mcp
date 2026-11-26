@@ -844,7 +844,20 @@ public static partial class ClaudeUnityBridge
         if (assetPath == null) return Err("prefab required, e.g. Assets/Prefabs/Enemy.prefab");
 
         var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
-        if (prefab == null) return Err("Prefab not found: " + assetPath);
+        if (prefab == null)
+        {
+            // Distinguish "nothing there" from "there, but Unity cannot use it as
+            // a prefab" — the usual cause is a format Unity does not import, such
+            // as .glb or .gltf without a glTF package, which land as DefaultAsset.
+            var existing = AssetDatabase.GetMainAssetTypeAtPath(assetPath);
+            if (existing == null)
+                return Err("No asset at " + assetPath);
+            if (existing.Name == "DefaultAsset")
+                return Err("Unity imported " + assetPath + " as an opaque file, not a model. " +
+                           "Unity reads .fbx, .obj and .dae natively; .glb/.gltf need a glTF package " +
+                           "(com.unity.cloud.gltfast). Re-export as FBX, or install that package.");
+            return Err(assetPath + " is a " + existing.Name + ", not a prefab or model.");
+        }
 
         Transform parent = null;
         var parentStr = ClaudeJson.Str(p, "parent");

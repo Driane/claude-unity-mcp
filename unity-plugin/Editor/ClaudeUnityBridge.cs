@@ -33,7 +33,20 @@ public static partial class ClaudeUnityBridge
         = new List<Dictionary<string, object>>();
 
     private const int MAX_LOGS = 200;
-    private const string URL = "http://localhost:6400/";
+    private const int PORT = 6400;
+
+    // All three loopback spellings. HttpListener matches on the request's Host
+    // header, so each spelling a client might dial needs its own prefix:
+    // "localhost" alone binds to whichever stack the OS resolves first (IPv6 only,
+    // in practice, on Windows) and leaves 127.0.0.1 unreachable, while the two
+    // literal addresses alone make a request for Host "localhost:6400" fail with
+    // HTTP 400 — which is how the MCP server addresses it.
+    private static readonly string[] PREFIXES =
+    {
+        "http://localhost:" + PORT + "/",
+        "http://127.0.0.1:" + PORT + "/",
+        "http://[::1]:" + PORT + "/"
+    };
 
     // Only the MCP server sends this header. A web page cannot add it to a
     // cross-origin request without a CORS preflight, which the bridge refuses,
@@ -45,6 +58,9 @@ public static partial class ClaudeUnityBridge
         Application.logMessageReceived += CaptureLog;
         EditorApplication.update += DrainQueue;
         EditorApplication.quitting += Shutdown;
+        // Without this, recompiling any script leaves the old listener holding
+        // the port, and the bridge cannot rebind until Unity is restarted.
+        AssemblyReloadEvents.beforeAssemblyReload += Shutdown;
         CompilationPipeline.compilationStarted += OnCompilationStarted;
         CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompiled;
         Start();
@@ -54,18 +70,28 @@ public static partial class ClaudeUnityBridge
 
     static void Start()
     {
+        var bound = new List<string>();
         try
         {
             _listener = new HttpListener();
-            _listener.Prefixes.Add(URL);
+            foreach (var prefix in PREFIXES)
+            {
+                // A machine with IPv6 disabled rejects the [::1] prefix; one
+                // working prefix is enough.
+                try { _listener.Prefixes.Add(prefix); bound.Add(prefix); }
+                catch (Exception e) { Debug.LogWarning("[ClaudeUnity] Prefix refused: " + prefix + " (" + e.Message + ")"); }
+            }
+            if (bound.Count == 0) { Debug.LogError("[ClaudeUnity] No usable prefix, bridge not started."); return; }
+
             _listener.Start();
             _listenerThread = new Thread(AcceptLoop) { IsBackground = true, Name = "ClaudeUnityBridge" };
             _listenerThread.Start();
-            Debug.Log("[ClaudeUnity] Bridge listening on " + URL);
+            Debug.Log("[ClaudeUnity] Bridge listening on " + string.Join(" and ", bound));
         }
         catch (Exception e)
         {
-            Debug.LogError("[ClaudeUnity] Could not start HTTP server: " + e.Message);
+            Debug.LogError("[ClaudeUnity] Could not start HTTP server: " + e.Message +
+                           " — another Editor or a stale instance may already hold port " + PORT + ".");
         }
     }
 
@@ -110,9 +136,10 @@ public static partial class ClaudeUnityBridge
     {
         EditorApplication.update -= DrainQueue;
         Application.logMessageReceived -= CaptureLog;
+        AssemblyReloadEvents.beforeAssemblyReload -= Shutdown;
         CompilationPipeline.compilationStarted -= OnCompilationStarted;
         CompilationPipeline.assemblyCompilationFinished -= OnAssemblyCompiled;
-        try { if (_listener != null) { _listener.Stop(); _listener.Close(); } } catch { }
+        try { if (_listener != null) { _listener.Stop(); _listener.Close(); _listener = null; } } catch { }
     }
 
     // ── Command dispatcher ────────────────────────────────────────────────────
