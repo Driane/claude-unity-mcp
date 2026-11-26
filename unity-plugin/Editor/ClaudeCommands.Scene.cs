@@ -597,8 +597,25 @@ public static partial class ClaudeUnityBridge
         Undo.RecordObject(target, "Claude: Set " + propertyName);
         if (!ApplyValue(sp, value, out error)) return false;
 
+        // Unity drops a reference that does not fit the field without raising
+        // anything, so confirm the write landed rather than reporting success
+        // on trust.
+        var wasReference = sp.propertyType == SerializedPropertyType.ObjectReference;
+        var intended = wasReference ? sp.objectReferenceValue : null;
+
         so.ApplyModifiedProperties();
         EditorUtility.SetDirty(target);
+
+        if (wasReference && intended != null)
+        {
+            var check = FindProperty(new SerializedObject(target), propertyName);
+            if (check == null || check.objectReferenceValue == null)
+            {
+                error = "Unity rejected '" + intended.name + "' (" + intended.GetType().Name +
+                        ") for this field — it expects a different type";
+                return false;
+            }
+        }
         return true;
     }
 
@@ -702,16 +719,38 @@ public static partial class ClaudeUnityBridge
                 error = "expected [x,y,z] Euler degrees or [x,y,z,w]"; return false;
 
             case SerializedPropertyType.Enum:
-                if (number.HasValue) { sp.enumValueIndex = (int)Math.Round(number.Value); return true; }
+                // A number is the enum's stored value, not its position in the list.
+                // CameraClearFlags starts at 1, so position 2 is "Depth only" while
+                // the value 2 is "Solid Color"; intValue writes the real value.
+                if (number.HasValue) { sp.intValue = (int)Math.Round(number.Value); return true; }
                 if (text != null && sp.enumNames != null)
                 {
+                    // Unity spells several of these for display ("Depth only"), so
+                    // compare without spaces or underscores: "SolidColor" has to
+                    // match "Solid Color".
+                    var wanted = text.Replace(" ", "").Replace("_", "");
                     for (int i = 0; i < sp.enumNames.Length; i++)
-                        if (sp.enumNames[i].Equals(text, StringComparison.OrdinalIgnoreCase))
-                        { sp.enumValueIndex = i; return true; }
+                    {
+                        if (!sp.enumNames[i].Replace(" ", "")
+                                .Equals(wanted, StringComparison.OrdinalIgnoreCase)) continue;
+                        sp.enumValueIndex = i;
+                        return true;
+                    }
+                    var displayNames = sp.enumDisplayNames;
+                    if (displayNames != null)
+                    {
+                        for (int i = 0; i < displayNames.Length; i++)
+                        {
+                            if (!displayNames[i].Replace(" ", "")
+                                    .Equals(wanted, StringComparison.OrdinalIgnoreCase)) continue;
+                            sp.enumValueIndex = i;
+                            return true;
+                        }
+                    }
                     error = "unknown value; valid: " + string.Join(", ", sp.enumNames);
                     return false;
                 }
-                error = "expected an enum name or index"; return false;
+                error = "expected an enum name or value"; return false;
 
             case SerializedPropertyType.LayerMask:
                 if (number.HasValue) { sp.intValue = (int)Math.Round(number.Value); return true; }
@@ -737,6 +776,15 @@ public static partial class ClaudeUnityBridge
                     return false;
                 }
                 sp.objectReferenceValue = resolved;
+                // Unity clears the field on the spot when the type does not fit,
+                // so check here rather than reporting a success that never happened.
+                if (sp.objectReferenceValue == null)
+                {
+                    error = "Unity rejected '" + resolved.name + "' (" + resolved.GetType().Name +
+                            ") — this field expects " +
+                            (expected == null ? "another type" : expected.Name);
+                    return false;
+                }
                 return true;
 
             case SerializedPropertyType.ArraySize:
@@ -776,14 +824,20 @@ public static partial class ClaudeUnityBridge
         }
     }
 
-    /// <summary>Unity reports reference types as "PPtr&lt;$Material&gt;" — pull the name out.</summary>
+    /// <summary>
+    /// Unity reports reference types as "PPtr&lt;$Material&gt;" — but not always:
+    /// some fields report "PPtr&lt;Sprite&gt;" with no dollar. Keying on the dollar
+    /// silently loses the expected type, and then any asset at the path looks
+    /// acceptable. Read between the angle brackets instead.
+    /// </summary>
     static Type ExpectedReferenceType(SerializedProperty sp)
     {
         var raw = sp.type;
-        int start = raw.IndexOf('$');
-        int end = raw.LastIndexOf('>');
-        if (start < 0 || end <= start) return null;
-        return FindType(raw.Substring(start + 1, end - start - 1));
+        int open = raw.IndexOf('<');
+        int close = raw.LastIndexOf('>');
+        if (open < 0 || close <= open) return null;
+        var name = raw.Substring(open + 1, close - open - 1).TrimStart('$');
+        return string.IsNullOrEmpty(name) ? null : FindType(name);
     }
 
     static UnityEngine.Object ResolveObjectReference(string reference, Type expected)
@@ -795,14 +849,17 @@ public static partial class ClaudeUnityBridge
             {
                 var typed = AssetDatabase.LoadAssetAtPath(reference, expected);
                 if (typed != null) return typed;
-            }
-            var main = AssetDatabase.LoadMainAssetAtPath(reference);
-            if (main != null) return main;
 
-            // Sub-assets, e.g. one sprite inside a sliced sheet.
-            foreach (var sub in AssetDatabase.LoadAllAssetsAtPath(reference))
-                if (sub != null && (expected == null || expected.IsInstanceOfType(sub))) return sub;
-            return null;
+                // What the field wants is often a sub-asset: the main asset of a
+                // .png is a Texture2D while the Sprite hangs underneath it. Search
+                // the sub-assets BEFORE considering the main one, and never return
+                // an object of the wrong type — Unity would drop it without a word.
+                foreach (var sub in AssetDatabase.LoadAllAssetsAtPath(reference))
+                    if (sub != null && expected.IsInstanceOfType(sub)) return sub;
+                return null;
+            }
+
+            return AssetDatabase.LoadMainAssetAtPath(reference);
         }
 
         var go = ResolveGameObject(reference);

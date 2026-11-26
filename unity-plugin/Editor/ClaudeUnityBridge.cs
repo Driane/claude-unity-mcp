@@ -199,6 +199,7 @@ public static partial class ClaudeUnityBridge
             case "capture_screenshot":     return CmdCaptureScreenshot(p);
             case "build_player":           return CmdBuildPlayer(p);
             case "set_play_mode":          return CmdSetPlayMode(p);
+            case "step_frames":            return CmdStepFrames(p);
             case "get_logs":               return CmdGetLogs(p);
 
             default:                       return Err("Unknown action: " + action);

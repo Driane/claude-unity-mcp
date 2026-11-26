@@ -10,7 +10,7 @@ screenshots and build the game.
 Claude Code ──stdio (MCP)──▶ mcp-server (Node.js) ──HTTP, localhost:6400──▶ Unity Editor bridge (C#)
 ```
 
-- **`mcp-server/`** exposes 37 tools over the Model Context Protocol and forwards each call to Unity
+- **`mcp-server/`** exposes 38 tools over the Model Context Protocol and forwards each call to Unity
   as a JSON command. Timeouts are per tool, so a build gets 15 minutes while a scene query gets 15 seconds.
 - **`unity-plugin/Editor/`** is an Editor-only plugin that starts an `HttpListener` on
   `localhost:6400` when Unity loads. Requests are accepted on a background thread and queued; the
@@ -100,6 +100,7 @@ built-in components and the fields of your own scripts alike:
 | `unity_execute_menu_item` | Run any Editor menu item — the escape hatch |
 | `unity_capture_screenshot` | Render a camera to a PNG and return its path, so Claude can look at it |
 | `unity_set_play_mode` | Enter or exit Play Mode |
+| `unity_step_frames` | Advance Play Mode frame by frame — how a scripted test actually runs the game |
 | `unity_build_player` | Build the game, reporting result, size, duration and error count |
 
 `unity_open_scene` and `unity_new_scene` refuse to throw away unsaved work: they return the list of
@@ -152,6 +153,21 @@ Set `CLAUDE_UNITY_URL` to point the server at a different host or port.
 - **Lightmap baking**, which is long-running and would need the same polling model as tests.
 
 ## Pitfalls found by running it
+
+- **Play Mode does not run unless the Editor window has OS focus.** Drive Unity from a script and
+  the game sits frozen on frame 1 — `isPlaying` is true, components are enabled, `timeScale` is 1,
+  and nothing moves. Neither `PlayerSettings.runInBackground` nor `Application.runInBackground`
+  changes this. `unity_step_frames` advances the loop explicitly, which also makes a test
+  deterministic. Any automated play test needs it.
+- **Object reference fields.** Unity reports a reference field's type as `PPtr<$Material>` *or*
+  `PPtr<Sprite>` — the dollar is not always there. The main asset is often the wrong object too:
+  a `.png` has a `Texture2D` as its main asset and the `Sprite` as a sub-asset. Assigning the wrong
+  type leaves the field null, and `SerializedProperty` clears it on the spot without an error, so
+  the bridge verifies every reference write instead of reporting success on trust.
+- **Enum properties take a value, not a position.** `CameraClearFlags` starts at 1, so the position
+  2 is "Depth only" while the value 2 is "Solid Color" — setting clear flags by position gives a
+  camera that clears nothing and renders black. Names are matched ignoring spaces, so `SolidColor`
+  finds `Solid Color`.
 
 - **Loopback spellings.** The bridge registers three prefixes: `localhost`, `127.0.0.1` and `[::1]`.
   `HttpListener` matches on the request's Host header, so each spelling a client might dial needs

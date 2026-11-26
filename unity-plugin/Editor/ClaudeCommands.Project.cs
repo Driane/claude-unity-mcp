@@ -235,6 +235,27 @@ public static partial class ClaudeUnityBridge
                     "note", "The switch takes a moment; call get_status or get_logs to see the result."));
     }
 
+    static string CmdStepFrames(object p)
+    {
+        if (!EditorApplication.isPlaying)
+            return Err("Not in Play Mode — call set_play_mode first");
+
+        int frames = ClaudeJson.Int(p, "frames") ?? 60;
+        if (frames < 1 || frames > 20000) return Err("frames must be between 1 and 20000");
+
+        var depart = Time.frameCount;
+        for (int i = 0; i < frames; i++) EditorApplication.Step();
+
+        return Ok(D(
+            "framesRequested", frames,
+            "frameCount",      Time.frameCount,
+            "framesAdvanced",  Time.frameCount - depart,
+            "time",            Time.time,
+            "note", "Play Mode only advances on its own while the Editor window has " +
+                    "OS focus. Stepping makes a test deterministic and independent of that."
+        ));
+    }
+
     // ── Build ─────────────────────────────────────────────────────────────────
 
     static string CmdBuildPlayer(object p)

@@ -388,6 +388,12 @@ const SPEC = [
     required: ['play'],
   },
   {
+    name: 'unity_step_frames', action: 'step_frames',
+    description: 'Advance Play Mode by a number of frames. Essential for testing: the Editor only runs the game on its own while its window has OS focus, so a scripted test that drives Unity from outside sees a frozen game unless it steps. Stepping is also deterministic.',
+    properties: { frames: num('How many frames (default 60, max 20000). 50 frames is about one second.') },
+    timeout: 300000,
+  },
+  {
     name: 'unity_build_player', action: 'build_player',
     description: 'Build the project. Long-running: can take several minutes.',
     properties: {
