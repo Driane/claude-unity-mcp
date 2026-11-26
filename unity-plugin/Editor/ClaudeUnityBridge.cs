@@ -1,22 +1,37 @@
 using UnityEngine;
 using UnityEditor;
-using UnityEditor.SceneManagement;
+using UnityEditor.Compilation;
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Threading;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
+/// <summary>
+/// HTTP bridge that lets the Claude MCP server drive this Editor.
+///
+/// Claude Code --stdio--> mcp-server (Node) --HTTP localhost:6400--> this bridge
+///
+/// Requests are accepted on a background thread and queued; every command runs
+/// on Unity's main thread from EditorApplication.update, because the Unity API
+/// is not thread-safe. Scene changes go through Undo, so Ctrl+Z reverts them.
+///
+/// Commands live in the ClaudeCommands.*.cs partial files.
+/// </summary>
 [InitializeOnLoad]
-public static class ClaudeUnityBridge
+public static partial class ClaudeUnityBridge
 {
     private static HttpListener _listener;
     private static Thread _listenerThread;
-    private static readonly ConcurrentQueue<(HttpListenerContext ctx, string body)> _queue
-        = new ConcurrentQueue<(HttpListenerContext, string)>();
+    private static readonly ConcurrentQueue<KeyValuePair<HttpListenerContext, string>> _queue
+        = new ConcurrentQueue<KeyValuePair<HttpListenerContext, string>>();
+
     private static readonly List<string> _logs = new List<string>();
+    private static readonly List<Dictionary<string, object>> _compileMessages
+        = new List<Dictionary<string, object>>();
+
     private const int MAX_LOGS = 200;
     private const string URL = "http://localhost:6400/";
 
@@ -30,6 +45,8 @@ public static class ClaudeUnityBridge
         Application.logMessageReceived += CaptureLog;
         EditorApplication.update += DrainQueue;
         EditorApplication.quitting += Shutdown;
+        CompilationPipeline.compilationStarted += OnCompilationStarted;
+        CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompiled;
         Start();
     }
 
@@ -67,9 +84,10 @@ public static class ClaudeUnityBridge
                     ctx.Response.Close();
                     continue;
                 }
-                using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-                var body = reader.ReadToEnd();
-                _queue.Enqueue((ctx, body));
+                string body;
+                using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
+                    body = reader.ReadToEnd();
+                _queue.Enqueue(new KeyValuePair<HttpListenerContext, string>(ctx, body));
             }
             catch { /* listener stopped */ }
         }
@@ -78,12 +96,13 @@ public static class ClaudeUnityBridge
     // Runs on the Unity main thread every frame
     static void DrainQueue()
     {
-        while (_queue.TryDequeue(out var item))
+        KeyValuePair<HttpListenerContext, string> item;
+        while (_queue.TryDequeue(out item))
         {
             string response;
-            try   { response = Dispatch(item.body); }
-            catch (Exception e) { response = Err(e.Message); }
-            Reply(item.ctx, response);
+            try { response = Dispatch(item.Value); }
+            catch (Exception e) { response = Err(e.GetType().Name + ": " + e.Message); }
+            Reply(item.Key, response);
         }
     }
 
@@ -91,177 +110,236 @@ public static class ClaudeUnityBridge
     {
         EditorApplication.update -= DrainQueue;
         Application.logMessageReceived -= CaptureLog;
-        try { _listener?.Stop(); _listener?.Close(); } catch { }
+        CompilationPipeline.compilationStarted -= OnCompilationStarted;
+        CompilationPipeline.assemblyCompilationFinished -= OnAssemblyCompiled;
+        try { if (_listener != null) { _listener.Stop(); _listener.Close(); } } catch { }
     }
 
     // ── Command dispatcher ────────────────────────────────────────────────────
 
     static string Dispatch(string body)
     {
-        var action = ParseString(body, "action");
-        var p = ParseObject(body, "params");
+        var request = ClaudeJson.ParseObject(body);
+        var action = ClaudeJson.Str(request, "action");
+        var p = ClaudeJson.Get(request, "params");
 
-        return action switch
+        switch (action)
         {
-            "get_status"        => CmdStatus(),
-            "get_hierarchy"     => CmdHierarchy(),
-            "create_gameobject" => CmdCreateGO(p),
-            "delete_gameobject" => CmdDeleteGO(p),
-            "write_script"      => CmdWriteScript(p),
-            "add_component"     => CmdAddComponent(p),
-            "set_transform"     => CmdSetTransform(p),
-            "set_play_mode"     => CmdSetPlayMode(p),
-            "save_scene"        => CmdSaveScene(),
-            "get_logs"          => CmdGetLogs(p),
-            _                   => Err($"Unknown action: {action}")
-        };
+            // Scene and GameObjects
+            case "get_status":             return CmdStatus();
+            case "get_hierarchy":          return CmdHierarchy(p);
+            case "find_gameobjects":       return CmdFindGameObjects(p);
+            case "get_gameobject":         return CmdGetGameObject(p);
+            case "create_gameobject":      return CmdCreateGameObject(p);
+            case "delete_gameobject":      return CmdDeleteGameObject(p);
+            case "duplicate_gameobject":   return CmdDuplicateGameObject(p);
+            case "rename_gameobject":      return CmdRenameGameObject(p);
+            case "set_active":             return CmdSetActive(p);
+            case "set_parent":             return CmdSetParent(p);
+            case "set_transform":          return CmdSetTransform(p);
+            case "set_tag_layer":          return CmdSetTagLayer(p);
+
+            // Components
+            case "add_component":          return CmdAddComponent(p);
+            case "remove_component":       return CmdRemoveComponent(p);
+            case "set_component_property": return CmdSetComponentProperty(p);
+
+            // Prefabs
+            case "create_prefab":          return CmdCreatePrefab(p);
+            case "instantiate_prefab":     return CmdInstantiatePrefab(p);
+
+            // Assets
+            case "write_script":           return CmdWriteScript(p);
+            case "create_material":        return CmdCreateMaterial(p);
+            case "assign_material":        return CmdAssignMaterial(p);
+            case "create_asset":           return CmdCreateAsset(p);
+            case "import_file":            return CmdImportFile(p);
+            case "set_texture_settings":   return CmdSetTextureSettings(p);
+            case "list_assets":            return CmdListAssets(p);
+            case "delete_asset":           return CmdDeleteAsset(p);
+
+            // Scenes
+            case "save_scene":             return CmdSaveScene(p);
+            case "open_scene":             return CmdOpenScene(p);
+            case "new_scene":              return CmdNewScene(p);
+            case "set_lighting":           return CmdSetLighting(p);
+
+            // Project and Editor
+            case "install_package":        return CmdInstallPackage(p);
+            case "list_packages":          return CmdListPackages(p);
+            case "compile_status":         return CmdCompileStatus(p);
+            case "execute_menu_item":      return CmdExecuteMenuItem(p);
+            case "capture_screenshot":     return CmdCaptureScreenshot(p);
+            case "build_player":           return CmdBuildPlayer(p);
+            case "set_play_mode":          return CmdSetPlayMode(p);
+            case "get_logs":               return CmdGetLogs(p);
+
+            default:                       return Err("Unknown action: " + action);
+        }
     }
 
-    // ── Commands ──────────────────────────────────────────────────────────────
+    // ── Status, logs, compilation ─────────────────────────────────────────────
 
     static string CmdStatus()
     {
         var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
         return Ok(D(
-            "scene",        scene.name,
-            "scenePath",    scene.path,
-            "rootObjects",  scene.rootCount,
-            "isPlaying",    EditorApplication.isPlaying,
-            "unityVersion", Application.unityVersion
+            "scene",         scene.name,
+            "scenePath",     scene.path,
+            "sceneDirty",    scene.isDirty,
+            "rootObjects",   scene.rootCount,
+            "isPlaying",     EditorApplication.isPlaying,
+            "isCompiling",   EditorApplication.isCompiling,
+            "isUpdating",    EditorApplication.isUpdating,
+            "unityVersion",  Application.unityVersion,
+            "projectPath",   Directory.GetParent(Application.dataPath).FullName,
+            "bridgeVersion", "2.0.0"
         ));
-    }
-
-    static string CmdHierarchy()
-    {
-        var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
-        var roots = scene.GetRootGameObjects();
-        var items = new List<object>();
-        foreach (var go in roots) items.Add(BuildNode(go, ""));
-        return Ok(D("hierarchy", items));
-    }
-
-    static Dictionary<string, object> BuildNode(GameObject go, string parentPath)
-    {
-        var path = parentPath.Length == 0 ? go.name : parentPath + "/" + go.name;
-        var comps = new List<string>();
-        foreach (var c in go.GetComponents<Component>())
-            if (c != null) comps.Add(c.GetType().Name);
-        var children = new List<object>();
-        foreach (Transform child in go.transform)
-            children.Add(BuildNode(child.gameObject, path));
-        return D("name", go.name, "path", path, "active", go.activeSelf, "components", comps, "children", children);
-    }
-
-    static string CmdCreateGO(string p)
-    {
-        var name      = ParseString(p, "name");      if (name == null) return Err("name required");
-        var primitive = ParseString(p, "primitive");
-        var parentStr = ParseString(p, "parent");
-        var pos       = ParseFloats(p, "position");
-
-        GameObject go;
-        if (!string.IsNullOrEmpty(primitive) && Enum.TryParse<PrimitiveType>(primitive, true, out var pt))
-            go = GameObject.CreatePrimitive(pt);
-        else
-            go = new GameObject();
-        go.name = name;
-
-        if (!string.IsNullOrEmpty(parentStr))
-        {
-            var parent = GameObject.Find(parentStr);
-            if (parent != null) go.transform.SetParent(parent.transform, false);
-        }
-        if (pos != null && pos.Length == 3)
-            go.transform.position = new Vector3(pos[0], pos[1], pos[2]);
-
-        Undo.RegisterCreatedObjectUndo(go, "Claude: Create " + name);
-        return Ok(D("name", go.name, "path", GetPath(go)));
-    }
-
-    static string CmdDeleteGO(string p)
-    {
-        var path = ParseString(p, "path"); if (path == null) return Err("path required");
-        var go = GameObject.Find(path);
-        if (go == null) return Err("Not found: " + path);
-        Undo.DestroyObjectImmediate(go);
-        return Ok(D("deleted", path));
-    }
-
-    static string CmdWriteScript(string p)
-    {
-        var filename  = ParseString(p, "filename"); if (filename == null) return Err("filename required");
-        var content   = ParseString(p, "content");  if (content  == null) return Err("content required");
-        var subfolder = ParseString(p, "subfolder") ?? "";
-
-        var dir = Path.Combine(Application.dataPath, "Scripts");
-        if (!string.IsNullOrEmpty(subfolder)) dir = Path.Combine(dir, subfolder);
-        Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, filename), content, Encoding.UTF8);
-        AssetDatabase.Refresh();
-
-        var assetPath = "Assets/Scripts/" + (string.IsNullOrEmpty(subfolder) ? "" : subfolder + "/") + filename;
-        return Ok(D("path", assetPath));
-    }
-
-    static string CmdAddComponent(string p)
-    {
-        var goPath = ParseString(p, "gameobject"); if (goPath == null) return Err("gameobject required");
-        var cName  = ParseString(p, "component");  if (cName  == null) return Err("component required");
-        var go = GameObject.Find(goPath); if (go == null) return Err("Not found: " + goPath);
-        var type = FindType(cName); if (type == null) return Err("Type not found: " + cName);
-        Undo.AddComponent(go, type);
-        return Ok(D("added", type.Name, "to", GetPath(go)));
-    }
-
-    static string CmdSetTransform(string p)
-    {
-        var goPath = ParseString(p, "gameobject"); if (goPath == null) return Err("gameobject required");
-        var go = GameObject.Find(goPath); if (go == null) return Err("Not found: " + goPath);
-        Undo.RecordObject(go.transform, "Claude: Set Transform");
-        var pos = ParseFloats(p, "position");
-        var rot = ParseFloats(p, "rotation");
-        var scl = ParseFloats(p, "scale");
-        if (pos != null && pos.Length == 3) go.transform.position    = new Vector3(pos[0], pos[1], pos[2]);
-        if (rot != null && rot.Length == 3) go.transform.eulerAngles = new Vector3(rot[0], rot[1], rot[2]);
-        if (scl != null && scl.Length == 3) go.transform.localScale  = new Vector3(scl[0], scl[1], scl[2]);
-        return Ok(D("gameobject", goPath));
-    }
-
-    static string CmdSetPlayMode(string p)
-    {
-        var val = ParseString(p, "play");
-        EditorApplication.isPlaying = val == "true";
-        return Ok(D("isPlaying", EditorApplication.isPlaying));
-    }
-
-    static string CmdSaveScene()
-    {
-        EditorSceneManager.SaveOpenScenes();
-        return Ok(D("saved", true));
-    }
-
-    static string CmdGetLogs(string p)
-    {
-        int count = 20;
-        var cStr = ParseString(p, "count");
-        if (cStr != null) int.TryParse(cStr, out count);
-        lock (_logs)
-        {
-            var start = Math.Max(0, _logs.Count - count);
-            return Ok(D("logs", _logs.GetRange(start, _logs.Count - start)));
-        }
     }
 
     static void CaptureLog(string msg, string stack, LogType type)
     {
         lock (_logs)
         {
-            _logs.Add($"[{type}] {msg}");
+            _logs.Add("[" + type + "] " + msg);
             if (_logs.Count > MAX_LOGS) _logs.RemoveAt(0);
         }
     }
 
-    // ── Utilities ─────────────────────────────────────────────────────────────
+    static string CmdGetLogs(object p)
+    {
+        int count = ClaudeJson.Int(p, "count") ?? 20;
+        var onlyErrors = ClaudeJson.Bool(p, "errors_only", false);
+        lock (_logs)
+        {
+            var source = new List<string>();
+            foreach (var line in _logs)
+            {
+                if (onlyErrors && !line.StartsWith("[Error") && !line.StartsWith("[Exception")
+                    && !line.StartsWith("[Assert")) continue;
+                source.Add(line);
+            }
+            int start = Math.Max(0, source.Count - count);
+            return Ok(D("logs", source.GetRange(start, source.Count - start), "total", source.Count));
+        }
+    }
+
+    static void OnCompilationStarted(object context)
+    {
+        lock (_compileMessages) _compileMessages.Clear();
+    }
+
+    static void OnAssemblyCompiled(string assemblyPath, CompilerMessage[] messages)
+    {
+        lock (_compileMessages)
+        {
+            foreach (var m in messages)
+            {
+                if (m.type != CompilerMessageType.Error && m.type != CompilerMessageType.Warning) continue;
+                _compileMessages.Add(D(
+                    "type",     m.type.ToString(),
+                    "message",  m.message,
+                    "file",     m.file,
+                    "line",     m.line,
+                    "assembly", Path.GetFileName(assemblyPath)
+                ));
+            }
+        }
+    }
+
+    static string CmdCompileStatus(object p)
+    {
+        if (ClaudeJson.Bool(p, "refresh", false)) AssetDatabase.Refresh();
+
+        lock (_compileMessages)
+        {
+            var errors = new List<object>();
+            var warnings = new List<object>();
+            foreach (var m in _compileMessages)
+            {
+                if ((string)m["type"] == "Error") errors.Add(m);
+                else warnings.Add(m);
+            }
+            return Ok(D(
+                "isCompiling", EditorApplication.isCompiling,
+                "isUpdating",  EditorApplication.isUpdating,
+                "errorCount",  errors.Count,
+                "errors",      errors,
+                "warnings",    warnings,
+                "note",        EditorApplication.isCompiling
+                    ? "Still compiling — call again in a moment for the final result."
+                    : "Compilation idle. Messages are from the last compile in this session."
+            ));
+        }
+    }
+
+    // ── Shared utilities ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Find a GameObject by hierarchy path or name, in any loaded scene,
+    /// including inactive objects — which GameObject.Find cannot do.
+    /// </summary>
+    static GameObject ResolveGameObject(string pathOrName)
+    {
+        if (string.IsNullOrEmpty(pathOrName)) return null;
+
+        var parts = pathOrName.Split('/');
+        var sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+
+        // 1. Exact path from a scene root, walking children by name.
+        for (int s = 0; s < sceneCount; s++)
+        {
+            var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(s);
+            if (!scene.isLoaded) continue;
+            foreach (var root in scene.GetRootGameObjects())
+            {
+                if (root.name != parts[0]) continue;
+                var current = root.transform;
+                bool matched = true;
+                for (int i = 1; i < parts.Length && matched; i++)
+                {
+                    matched = false;
+                    foreach (Transform child in current)
+                    {
+                        if (child.name != parts[i]) continue;
+                        current = child;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) return current.gameObject;
+            }
+        }
+
+        // 2. Active-object path lookup (handles paths we may have missed).
+        var found = GameObject.Find(pathOrName);
+        if (found != null) return found;
+
+        // 3. Name search anywhere in the hierarchy, inactive objects included.
+        var leaf = parts[parts.Length - 1];
+        for (int s = 0; s < sceneCount; s++)
+        {
+            var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(s);
+            if (!scene.isLoaded) continue;
+            foreach (var root in scene.GetRootGameObjects())
+            {
+                var hit = SearchByName(root.transform, leaf);
+                if (hit != null) return hit;
+            }
+        }
+        return null;
+    }
+
+    static GameObject SearchByName(Transform t, string name)
+    {
+        if (t.name == name) return t.gameObject;
+        foreach (Transform child in t)
+        {
+            var hit = SearchByName(child, name);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
 
     static string GetPath(GameObject go)
     {
@@ -271,14 +349,66 @@ public static class ClaudeUnityBridge
         return string.Join("/", parts);
     }
 
-    static Type FindType(string name)
+    private static readonly Dictionary<string, Type> _typeCache = new Dictionary<string, Type>();
+
+    /// <summary>
+    /// Resolve a type from a short name ("Rigidbody"), a namespaced name
+    /// ("UnityEngine.UI.Image") or a user script name. Optionally require a base type.
+    /// </summary>
+    static Type FindType(string name, Type mustInherit = null)
     {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        if (string.IsNullOrEmpty(name)) return null;
+
+        var cacheKey = name + "|" + (mustInherit == null ? "" : mustInherit.FullName);
+        Type cached;
+        if (_typeCache.TryGetValue(cacheKey, out cached)) return cached;
+
+        var candidates = new[]
         {
-            var t = asm.GetType(name) ?? asm.GetType("UnityEngine." + name);
-            if (t != null && typeof(Component).IsAssignableFrom(t)) return t;
+            name,
+            "UnityEngine." + name,
+            "UnityEngine.UI." + name,
+            "UnityEditor." + name,
+            "TMPro." + name
+        };
+
+        Type result = null;
+        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+
+        foreach (var candidate in candidates)
+        {
+            foreach (var asm in assemblies)
+            {
+                Type t;
+                try { t = asm.GetType(candidate); } catch { continue; }
+                if (t == null) continue;
+                if (mustInherit != null && !mustInherit.IsAssignableFrom(t)) continue;
+                result = t;
+                break;
+            }
+            if (result != null) break;
         }
-        return null;
+
+        // Last resort: match on the short type name across every loaded assembly.
+        if (result == null)
+        {
+            foreach (var asm in assemblies)
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); } catch { continue; }
+                foreach (var t in types)
+                {
+                    if (t.Name != name) continue;
+                    if (mustInherit != null && !mustInherit.IsAssignableFrom(t)) continue;
+                    result = t;
+                    break;
+                }
+                if (result != null) break;
+            }
+        }
+
+        _typeCache[cacheKey] = result;
+        return result;
     }
 
     static void Reply(HttpListenerContext ctx, string json)
@@ -295,132 +425,33 @@ public static class ClaudeUnityBridge
         catch { }
     }
 
-    // ── Minimal JSON serializer (zero dependencies) ───────────────────────────
+    // ── Response helpers ──────────────────────────────────────────────────────
 
-    static string Ok(Dictionary<string, object> d)  { d["success"] = true; return Serialize(d); }
-    static string Err(string msg)                    => $"{{\"success\":false,\"error\":{Str(msg)}}}";
+    static string Ok(Dictionary<string, object> d)
+    {
+        d["success"] = true;
+        return ClaudeJson.Serialize(d);
+    }
 
-    // Convenience: build a dict from alternating key/value pairs
+    static string Err(string msg)
+    {
+        return "{\"success\":false,\"error\":" + ClaudeJson.Quote(msg) + "}";
+    }
+
+    /// <summary>Error with extra context — e.g. the list of valid property names.</summary>
+    static string Err(string msg, Dictionary<string, object> extra)
+    {
+        extra["success"] = false;
+        extra["error"] = msg;
+        return ClaudeJson.Serialize(extra);
+    }
+
+    /// <summary>Build a dictionary from alternating key/value pairs.</summary>
     static Dictionary<string, object> D(params object[] pairs)
     {
         var d = new Dictionary<string, object>();
         for (int i = 0; i + 1 < pairs.Length; i += 2)
-            d[pairs[i]?.ToString()] = pairs[i + 1];
+            d[pairs[i] == null ? "null" : pairs[i].ToString()] = pairs[i + 1];
         return d;
-    }
-
-    static string Serialize(object value)
-    {
-        if (value == null)                             return "null";
-        if (value is bool b)                           return b ? "true" : "false";
-        if (value is int  i)                           return i.ToString();
-        if (value is long l)                           return l.ToString();
-        if (value is float f)                          return f.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        if (value is double dbl)                       return dbl.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        if (value is string s)                         return Str(s);
-        if (value is List<string> ls)                  return "[" + string.Join(",", ls.ConvertAll(Str)) + "]";
-        if (value is List<object> lo)                  return "[" + string.Join(",", lo.ConvertAll(Serialize)) + "]";
-        if (value is Dictionary<string, object> dict)
-        {
-            var sb = new StringBuilder("{");
-            bool first = true;
-            foreach (var kv in dict)
-            {
-                if (!first) sb.Append(',');
-                sb.Append(Str(kv.Key)).Append(':').Append(Serialize(kv.Value));
-                first = false;
-            }
-            return sb.Append('}').ToString();
-        }
-        return Str(value.ToString());
-    }
-
-    static string Str(string s)
-    {
-        if (s == null) return "null";
-        return "\"" + s
-            .Replace("\\", "\\\\")
-            .Replace("\"", "\\\"")
-            .Replace("\n", "\\n")
-            .Replace("\r", "\\r")
-            .Replace("\t", "\\t")
-            + "\"";
-    }
-
-    // ── Minimal JSON parser (handles strings, numbers, bools, arrays, objects) ─
-
-    // Returns the raw string value of a JSON key, or the serialized primitive
-    static string ParseString(string json, string key)
-    {
-        if (string.IsNullOrEmpty(json)) return null;
-        int idx = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
-        if (idx < 0) return null;
-        idx = json.IndexOf(':', idx) + 1;
-        while (idx < json.Length && json[idx] == ' ') idx++;
-        if (idx >= json.Length) return null;
-
-        if (json[idx] == '"')
-        {
-            // String value — respect escape sequences
-            var sb = new StringBuilder();
-            idx++; // skip opening quote
-            while (idx < json.Length && json[idx] != '"')
-            {
-                if (json[idx] == '\\' && idx + 1 < json.Length)
-                {
-                    idx++;
-                    sb.Append(json[idx] switch { 'n' => '\n', 'r' => '\r', 't' => '\t', '"' => '"', '\\' => '\\', _ => json[idx] });
-                }
-                else sb.Append(json[idx]);
-                idx++;
-            }
-            return sb.ToString();
-        }
-
-        // Non-string primitive (number, bool, null)
-        int end = idx;
-        while (end < json.Length && json[end] != ',' && json[end] != '}' && json[end] != ']')
-            end++;
-        return json.Substring(idx, end - idx).Trim();
-    }
-
-    // Returns the raw JSON substring of an object value for a given key
-    static string ParseObject(string json, string key)
-    {
-        if (string.IsNullOrEmpty(json)) return "{}";
-        int idx = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
-        if (idx < 0) return "{}";
-        idx = json.IndexOf('{', idx);
-        if (idx < 0) return "{}";
-        int depth = 0, start = idx;
-        bool inStr = false;
-        while (idx < json.Length)
-        {
-            char c = json[idx];
-            if (inStr) { if (c == '\\') idx++; else if (c == '"') inStr = false; }
-            else
-            {
-                if      (c == '"') inStr = true;
-                else if (c == '{') depth++;
-                else if (c == '}') { if (--depth == 0) return json.Substring(start, idx - start + 1); }
-            }
-            idx++;
-        }
-        return "{}";
-    }
-
-    static float[] ParseFloats(string json, string key)
-    {
-        if (string.IsNullOrEmpty(json)) return null;
-        int idx = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
-        if (idx < 0) return null;
-        idx = json.IndexOf('[', idx); if (idx < 0) return null;
-        int end = json.IndexOf(']', idx); if (end < 0) return null;
-        var parts = json.Substring(idx + 1, end - idx - 1).Split(',');
-        var result = new float[parts.Length];
-        for (int i = 0; i < parts.Length; i++)
-            if (!float.TryParse(parts[i].Trim(), System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out result[i])) return null;
-        return result;
     }
 }
